@@ -11,6 +11,7 @@ import com.example.vehicleapp.data.local.TokenStorage
 import com.example.vehicleapp.data.model.VehicleDetail
 import com.example.vehicleapp.data.model.VehicleSummary
 import com.example.vehicleapp.data.remote.NetworkModule
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -20,7 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 
-data class VehicleUiState(
+data class VehicleState(
     val isLoggedIn: Boolean = false,
     val isAuthenticating: Boolean = false,
     val authError: String? = null,
@@ -34,156 +35,190 @@ data class VehicleUiState(
     val selectedVehicle: VehicleDetail? = null
 )
 
+sealed interface VehicleIntent {
+    data object ToggleSearchVisibility : VehicleIntent
+    data class SearchQueryChanged(val value: String) : VehicleIntent
+    data object SubmitSearch : VehicleIntent
+    data object LoadRecentVehicles : VehicleIntent
+    data class OpenVehicleDetail(val vin: String) : VehicleIntent
+    data object DismissVehicleDetail : VehicleIntent
+    data object ClearDetailError : VehicleIntent
+    data class TokensChanged(val isLoggedIn: Boolean) : VehicleIntent
+}
+
 class VehicleViewModel(
     private val repository: VehicleRepository
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(VehicleUiState())
-    val uiState: StateFlow<VehicleUiState> = _uiState
+    private val _state = MutableStateFlow(VehicleState())
+    val state: StateFlow<VehicleState> = _state
+    private val intents = MutableSharedFlow<VehicleIntent>(extraBufferCapacity = 64)
     private val authMutex = Mutex()
     private var hasLoadedInitialVehicles = false
 
     init {
         viewModelScope.launch {
+            intents.collect { intent ->
+                handleIntent(intent)
+            }
+        }
+        viewModelScope.launch {
             repository.tokensFlow.collectLatest { tokens ->
-                _uiState.update { state ->
-                    state.copy(isLoggedIn = tokens != null)
-                }
-                if (tokens == null) {
-                    hasLoadedInitialVehicles = false
-                    _uiState.update { it.copy(selectedVehicle = null) }
-                    ensureAuthenticated()
-                } else if (!hasLoadedInitialVehicles) {
-                    loadRecentVehicles()
-                }
+                intents.emit(VehicleIntent.TokensChanged(tokens != null))
             }
         }
     }
 
-    fun toggleSearchVisibility() {
-        _uiState.update { it.copy(isSearchVisible = !it.isSearchVisible) }
+    fun onIntent(intent: VehicleIntent) {
+        if (!intents.tryEmit(intent)) {
+            viewModelScope.launch {
+                intents.emit(intent)
+            }
+        }
     }
 
-    fun onSearchQueryChange(value: String) {
-        _uiState.update { it.copy(searchQuery = value, listMessage = null) }
+    private suspend fun handleIntent(intent: VehicleIntent) {
+        when (intent) {
+            VehicleIntent.ToggleSearchVisibility -> toggleSearchVisibility()
+            is VehicleIntent.SearchQueryChanged -> onSearchQueryChange(intent.value)
+            VehicleIntent.SubmitSearch -> submitSearch()
+            VehicleIntent.LoadRecentVehicles -> loadRecentVehicles()
+            is VehicleIntent.OpenVehicleDetail -> openVehicleDetail(intent.vin)
+            VehicleIntent.DismissVehicleDetail -> dismissVehicleDetail()
+            VehicleIntent.ClearDetailError -> clearDetailError()
+            is VehicleIntent.TokensChanged -> onTokensChanged(intent.isLoggedIn)
+        }
     }
 
-    fun performSearch() {
-        val query = uiState.value.searchQuery
+    private suspend fun onTokensChanged(isLoggedIn: Boolean) {
+        reduce { state -> state.copy(isLoggedIn = isLoggedIn) }
+        if (!isLoggedIn) {
+            hasLoadedInitialVehicles = false
+            reduce { it.copy(selectedVehicle = null) }
+            ensureAuthenticated()
+        } else if (!hasLoadedInitialVehicles) {
+            loadRecentVehicles()
+        }
+    }
+
+    private suspend fun toggleSearchVisibility() {
+        reduce { it.copy(isSearchVisible = !it.isSearchVisible) }
+    }
+
+    private suspend fun onSearchQueryChange(value: String) {
+        reduce { it.copy(searchQuery = value, listMessage = null) }
+    }
+
+    private suspend fun submitSearch() {
+        val query = state.value.searchQuery
         val normalizedVin = normalizeVin(query)
         if (normalizedVin.isEmpty()) {
-            _uiState.update { it.copy(listMessage = "Введите запрос для поиска") }
+            reduce { it.copy(listMessage = "Введите запрос для поиска") }
             return
         }
-        viewModelScope.launch {
-            val authenticated = ensureAuthenticated()
-            if (!authenticated) {
-                return@launch
+        val authenticated = ensureAuthenticated()
+        if (!authenticated) {
+            return
+        }
+        reduce { it.copy(isLoading = true, listMessage = null, selectedVehicle = null) }
+        try {
+            val detail = repository.searchVehicleByVin(normalizedVin)
+            reduce {
+                it.copy(
+                    isLoading = false,
+                    selectedVehicle = detail,
+                    listMessage = null,
+                    detailError = null
+                )
             }
-            _uiState.update { it.copy(isLoading = true, listMessage = null, selectedVehicle = null) }
-            try {
-                val detail = repository.searchVehicleByVin(normalizedVin)
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        selectedVehicle = detail,
-                        listMessage = null,
-                        detailError = null
-                    )
-                }
-            } catch (notFound: VehicleNotFoundException) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        listMessage = notFound.message,
-                        selectedVehicle = null
-                    )
-                }
-            } catch (error: Exception) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        listMessage = error.message ?: "Ошибка поиска"
-                    )
-                }
+        } catch (notFound: VehicleNotFoundException) {
+            reduce {
+                it.copy(
+                    isLoading = false,
+                    listMessage = notFound.message,
+                    selectedVehicle = null
+                )
+            }
+        } catch (error: Exception) {
+            reduce {
+                it.copy(
+                    isLoading = false,
+                    listMessage = error.message ?: "Ошибка поиска"
+                )
             }
         }
     }
 
-    fun loadRecentVehicles() {
-        viewModelScope.launch {
-            val authenticated = ensureAuthenticated()
-            if (!authenticated) {
-                return@launch
+    private suspend fun loadRecentVehicles() {
+        val authenticated = ensureAuthenticated()
+        if (!authenticated) {
+            return
+        }
+        reduce { it.copy(isLoading = true, listMessage = null) }
+        try {
+            val vehicles = repository.getRecentVehicles()
+            hasLoadedInitialVehicles = true
+            reduce {
+                it.copy(
+                    isLoading = false,
+                    vehicles = vehicles,
+                    listMessage = if (vehicles.isEmpty()) "Данные отсутствуют" else null
+                )
             }
-            _uiState.update { it.copy(isLoading = true, listMessage = null) }
-            try {
-                val vehicles = repository.getRecentVehicles()
-                hasLoadedInitialVehicles = true
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        vehicles = vehicles,
-                        listMessage = if (vehicles.isEmpty()) "Данные отсутствуют" else null
-                    )
-                }
-            } catch (error: Exception) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        listMessage = error.message ?: "Не удалось загрузить данные"
-                    )
-                }
+        } catch (error: Exception) {
+            reduce {
+                it.copy(
+                    isLoading = false,
+                    listMessage = error.message ?: "Не удалось загрузить данные"
+                )
             }
         }
     }
 
-    fun openVehicleDetail(vin: String) {
-        viewModelScope.launch {
-            val authenticated = ensureAuthenticated()
-            if (!authenticated) {
-                return@launch
+    private suspend fun openVehicleDetail(vin: String) {
+        val authenticated = ensureAuthenticated()
+        if (!authenticated) {
+            return
+        }
+        reduce { it.copy(isDetailLoading = true, detailError = null) }
+        try {
+            val detail = repository.getVehicleDetail(vin)
+            reduce {
+                it.copy(
+                    isDetailLoading = false,
+                    selectedVehicle = detail,
+                    detailError = null
+                )
             }
-            _uiState.update { it.copy(isDetailLoading = true, detailError = null) }
-            try {
-                val detail = repository.getVehicleDetail(vin)
-                _uiState.update {
-                    it.copy(
-                        isDetailLoading = false,
-                        selectedVehicle = detail,
-                        detailError = null
-                    )
-                }
-            } catch (error: Exception) {
-                _uiState.update {
-                    it.copy(
-                        isDetailLoading = false,
-                        detailError = error.message ?: "Не удалось получить данные автомобиля",
-                        selectedVehicle = null
-                    )
-                }
+        } catch (error: Exception) {
+            reduce {
+                it.copy(
+                    isDetailLoading = false,
+                    detailError = error.message ?: "Не удалось получить данные автомобиля",
+                    selectedVehicle = null
+                )
             }
         }
     }
 
-    fun dismissVehicleDetail() {
-        _uiState.update { it.copy(selectedVehicle = null) }
+    private suspend fun dismissVehicleDetail() {
+        reduce { it.copy(selectedVehicle = null) }
     }
 
-    fun clearDetailError() {
-        _uiState.update { it.copy(detailError = null) }
+    private suspend fun clearDetailError() {
+        reduce { it.copy(detailError = null) }
     }
 
     private fun normalizeVin(value: String): String =
         value.uppercase(Locale.US).filter { it.isLetterOrDigit() }
 
     private suspend fun ensureAuthenticated(): Boolean = authMutex.withLock {
-        if (uiState.value.isLoggedIn) {
+        if (state.value.isLoggedIn) {
             return@withLock true
         }
         val credentials = CredentialsProvider.credentials()
         if (credentials.username.isBlank() || credentials.password.isBlank()) {
-            _uiState.update {
+            reduce {
                 it.copy(
                     authError = "Заполните логин и пароль в CredentialsProvider.kt",
                     isAuthenticating = false
@@ -191,13 +226,13 @@ class VehicleViewModel(
             }
             return@withLock false
         }
-        _uiState.update { it.copy(isAuthenticating = true, authError = null) }
+        reduce { it.copy(isAuthenticating = true, authError = null) }
         return@withLock try {
             repository.login(credentials.username, credentials.password)
-            _uiState.update { it.copy(isAuthenticating = false, authError = null) }
+            reduce { it.copy(isAuthenticating = false, authError = null) }
             true
         } catch (error: Exception) {
-            _uiState.update {
+            reduce {
                 it.copy(
                     isAuthenticating = false,
                     authError = error.message ?: "Не удалось авторизоваться"
@@ -205,6 +240,10 @@ class VehicleViewModel(
             }
             false
         }
+    }
+
+    private fun reduce(transform: (VehicleState) -> VehicleState) {
+        _state.update(transform)
     }
 }
 

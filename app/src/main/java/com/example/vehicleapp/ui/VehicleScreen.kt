@@ -52,16 +52,12 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -73,15 +69,18 @@ import androidx.compose.ui.unit.dp
 import com.example.vehicleapp.R
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
-import android.graphics.BitmapFactory
+import coil.ImageLoader
+import coil.compose.AsyncImagePainter
+import coil.compose.SubcomposeAsyncImage
+import coil.compose.SubcomposeAsyncImageContent
+import coil.request.ImageRequest
+import com.example.vehicleapp.data.local.TokenStorage
 import com.example.vehicleapp.data.model.VehicleDetail
 import com.example.vehicleapp.data.model.VehicleSpec
 import com.example.vehicleapp.data.model.VehicleSummary
+import com.example.vehicleapp.data.remote.AuthInterceptor
 import com.example.vehicleapp.ui.theme.VehicleAPPTheme
+import okhttp3.OkHttpClient
 
 @Composable
 fun VehicleApp() {
@@ -90,36 +89,26 @@ fun VehicleApp() {
         val vehicleViewModel: VehicleViewModel = viewModel(
             factory = VehicleViewModelFactory(context)
         )
-        val uiState by vehicleViewModel.uiState.collectAsStateWithLifecycle()
+        val state by vehicleViewModel.state.collectAsStateWithLifecycle()
         LaunchedEffect(Unit) {
-            vehicleViewModel.loadRecentVehicles()
+            vehicleViewModel.onIntent(VehicleIntent.LoadRecentVehicles)
         }
         VehicleScreen(
-            state = uiState,
-            onSearchToggle = vehicleViewModel::toggleSearchVisibility,
-            onSearchQueryChange = vehicleViewModel::onSearchQueryChange,
-            onSearchSubmit = vehicleViewModel::performSearch,
-            onVehicleClick = { vehicleViewModel.openVehicleDetail(it.vin) },
-            onDetailDismiss = vehicleViewModel::dismissVehicleDetail,
-            onDetailErrorDismiss = vehicleViewModel::clearDetailError
+            state = state,
+            onIntent = vehicleViewModel::onIntent
         )
     }
 }
 
 @Composable
 fun VehicleScreen(
-    state: VehicleUiState,
-    onSearchToggle: () -> Unit,
-    onSearchQueryChange: (String) -> Unit,
-    onSearchSubmit: () -> Unit,
-    onVehicleClick: (VehicleSummary) -> Unit,
-    onDetailDismiss: () -> Unit,
-    onDetailErrorDismiss: () -> Unit
+    state: VehicleState,
+    onIntent: (VehicleIntent) -> Unit
 ) {
     Scaffold(
         topBar = {
             VehicleTopBar(
-                onSearchClick = onSearchToggle
+                onSearchClick = { onIntent(VehicleIntent.ToggleSearchVisibility) }
             )
         }
     ) { innerPadding ->
@@ -137,22 +126,22 @@ fun VehicleScreen(
             if (state.detailError != null && state.selectedVehicle == null) {
                 DetailErrorBanner(
                     message = state.detailError,
-                    onDismiss = onDetailErrorDismiss
+                    onDismiss = { onIntent(VehicleIntent.ClearDetailError) }
                 )
             }
             SearchInput(
                 isVisible = state.isSearchVisible,
                 enabled = !state.isAuthenticating,
                 query = state.searchQuery,
-                onQueryChange = onSearchQueryChange,
-                onSearch = onSearchSubmit,
+                onQueryChange = { onIntent(VehicleIntent.SearchQueryChanged(it)) },
+                onSearch = { onIntent(VehicleIntent.SubmitSearch) },
                 isLoading = state.isLoading
             )
             VehicleListSection(
                 isLoading = state.isLoading,
                 vehicles = state.vehicles,
                 message = state.listMessage,
-                onVehicleClick = onVehicleClick
+                onVehicleClick = { onIntent(VehicleIntent.OpenVehicleDetail(it.vin)) }
             )
         }
     }
@@ -163,7 +152,7 @@ fun VehicleScreen(
     state.selectedVehicle?.let { vehicle ->
         VehicleDetailSheet(
             vehicle = vehicle,
-            onDismiss = onDetailDismiss
+            onDismiss = { onIntent(VehicleIntent.DismissVehicleDetail) }
         )
     }
 }
@@ -608,44 +597,38 @@ private fun RemoteImage(
     contentScale: ContentScale = ContentScale.Crop,
     placeholder: @Composable () -> Unit
 ) {
-    var imageBitmap by remember(url) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(url) {
-        imageBitmap = if (url.isNullOrBlank()) {
-            null
-        } else {
-            loadRemoteImage(url)
-        }
+    val context = LocalContext.current
+    val imageLoader = remember(context) {
+        val tokenStorage = TokenStorage(context)
+        val okHttpClient = OkHttpClient.Builder()
+            .addInterceptor(AuthInterceptor(tokenStorage))
+            .build()
+        ImageLoader.Builder(context)
+            .okHttpClient(okHttpClient)
+            .build()
     }
-    if (imageBitmap != null) {
-        Image(
-            bitmap = imageBitmap!!,
-            contentDescription = null,
-            modifier = modifier,
-            contentScale = contentScale
-        )
-    } else {
-        Box(
-            modifier = modifier,
-            contentAlignment = Alignment.Center
-        ) {
-            placeholder()
-        }
+    val request = remember(url) {
+        ImageRequest.Builder(context)
+            .data(url)
+            .crossfade(true)
+            .build()
     }
-}
-
-private suspend fun loadRemoteImage(url: String): ImageBitmap? = withContext(Dispatchers.IO) {
-    val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-        connectTimeout = 5000
-        readTimeout = 5000
-    }
-    try {
-        connection.inputStream.use { stream ->
-            BitmapFactory.decodeStream(stream)?.asImageBitmap()
+    SubcomposeAsyncImage(
+        model = request,
+        contentDescription = null,
+        imageLoader = imageLoader,
+        modifier = modifier,
+        contentScale = contentScale
+    ) {
+        when (painter.state) {
+            is AsyncImagePainter.State.Success -> SubcomposeAsyncImageContent()
+            else -> Box(
+                modifier = Modifier.matchParentSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                placeholder()
+            }
         }
-    } catch (_: Exception) {
-        null
-    } finally {
-        connection.disconnect()
     }
 }
 
@@ -668,7 +651,7 @@ private fun VehicleScreenPreview() {
     )
     VehicleAPPTheme {
         VehicleScreen(
-            state = VehicleUiState(
+            state = VehicleState(
                 isLoggedIn = true,
                 isSearchVisible = true,
                 searchQuery = "K123",
@@ -684,12 +667,7 @@ private fun VehicleScreenPreview() {
                     description = "Ухоженный автомобиль без ДТП."
                 )
             ),
-            onSearchToggle = {},
-            onSearchQueryChange = {},
-            onSearchSubmit = {},
-            onVehicleClick = {},
-            onDetailDismiss = {},
-            onDetailErrorDismiss = {}
+            onIntent = {}
         )
     }
 }
